@@ -10,13 +10,13 @@ const store = useReviewStore();
 const message = useMessage();
 const selectedId = defineModel<string>("selectedId", { default: "a" });
 const selected = computed(() => store.schemes.find((item) => item.id === selectedId.value) ?? store.schemes[0]);
-const currentScore = computed(() => store.record(selected.value.id));
+const currentScore = computed(() => store.findScore(selected.value.id));
 const form = reactive({ values: Object.fromEntries(store.criteria.map((item) => [item.id, 60])) as Record<string, number>, comment: "", conflict: false });
 const schema = toTypedSchema(z.object({ comment: z.string().min(4, "请至少填写4个字的评审意见") }));
 const { errors, validate } = useForm({ validationSchema: schema });
 
 watch(selectedId, () => {
-  const record = store.record(selected.value.id);
+  const record = store.findScore(selected.value.id);
   form.values = { ...(record?.values ?? Object.fromEntries(store.criteria.map((item) => [item.id, 60]))) };
   form.comment = record?.comment ?? "";
   form.conflict = record?.conflict ?? false;
@@ -25,20 +25,43 @@ watch(selectedId, () => {
 const weighted = computed(() => store.criteria.reduce((sum, item) => sum + form.values[item.id] * item.weight / 100, 0));
 const disabled = computed(() => store.isOrganizer || currentScore.value?.submitted || store.published);
 
+function describeOutcome(outcome: { ok: boolean; evicted: number; conflicts: { id: string }[] } | null, action: "draft" | "submit") {
+  if (!outcome) {
+    message.warning(action === "draft" ? "当前状态不可保存草稿" : "当前状态不可提交");
+    return;
+  }
+  if (!outcome.ok) {
+    message.warning("存档失败：已自动重试仍未写入，本次内容先保留在内存中（未存档），请尽快导出或清理空间后重试");
+    return;
+  }
+  if (outcome.conflicts.length) {
+    message.warning("该方案评分在其他窗口已被修改，已保留你当前草稿，未覆盖对方版本");
+    return;
+  }
+  if (outcome.evicted > 0) {
+    message.success(`${action === "draft" ? "评分草稿已保存" : "匿名评分已提交"}（容量不足，已腾退 ${outcome.evicted} 条旧流水后存档）`);
+    return;
+  }
+  message.success(action === "draft" ? "评分草稿已保存到本地" : "匿名评分已提交");
+}
+
 function draft() {
-  store.saveDraft(selected.value.id, form.values, form.comment, form.conflict);
-  message.success("评分草稿已保存到本地");
+  const outcome = store.saveDraft(selected.value.id, form.values, form.comment, form.conflict);
+  describeOutcome(outcome, "draft");
 }
 async function submit() {
   const result = await validate({ values: form } as any);
   if (!result.valid) return;
-  store.submit(selected.value.id, form.values, form.comment, form.conflict);
-  message.success("匿名评分已提交");
+  const outcome = store.submit(selected.value.id, form.values, form.comment, form.conflict);
+  describeOutcome(outcome, "submit");
 }
 </script>
 
 <template>
   <NAlert v-if="store.isOrganizer" type="info" show-icon>主办方在结果锁定前不能查看任何评委的评分值。</NAlert>
+  <NAlert v-if="store.archiveStatus === 'memory'" type="error" show-icon>当前无法写入本地存储，评分仅保留在内存中（未存档）。刷新或重开将丢失，请清理浏览器空间后重新保存。</NAlert>
+  <NAlert v-if="store.lastConflict" type="warning" show-icon>检测到其他窗口对同一方案的修改，已保留你当前草稿，未覆盖对方版本。</NAlert>
+  <NAlert v-if="store.didMigrate" type="info" show-icon>已兼容打开旧版存档：原有草稿与锁定结果均已保留，并补充版本信息。</NAlert>
   <div class="workspace">
     <NCard title="匿名方案" class="scheme-panel"><button v-for="item in store.schemes" :key="item.id" class="scheme" :class="{ active: selectedId === item.id }" @click="selectedId = item.id"><span>{{ item.code }}</span><b>{{ item.title }}</b><small>{{ item.publicNo }} · {{ item.status }}</small></button></NCard>
     <NCard class="score-panel">
